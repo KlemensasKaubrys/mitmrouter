@@ -1,9 +1,5 @@
 #!/bin/bash
 
-# Enhanced Wireless Access Point Setup Script
-# Supports 'nat', 'proxy_arp', and 'bridge' methods
-# Provides robust error handling and user feedback
-
 # VARIABLES
 # Interfaces (Set to empty to enable auto-detection)
 WAN_IFACE=""          # Internet-facing interface (e.g., eth0)
@@ -31,7 +27,6 @@ DNSMASQ_CONF="/tmp/tmp_dnsmasq.conf"
 HOSTAPD_CONF="/tmp/tmp_hostapd.conf"
 IPTABLES_RULES="/tmp/iptables.rules"
 
-# Functions for error handling and logging
 function log_info {
     echo -e "\e[32m[INFO]\e[0m $1"
 }
@@ -193,11 +188,15 @@ interface=$WIFI_IFACE
 bind-interfaces
 server=$LAN_DNS_SERVER
 dhcp-range=$LAN_DHCP_START,$LAN_DHCP_END,255.255.255.0,12h
+dhcp-option=3,$LAN_IP       # Gateway
+dhcp-option=6,$LAN_DNS_SERVER  # DNS Server
 EOF
 
+    # Start dnsmasq
     log_info "Starting dnsmasq"
     dnsmasq -C "$DNSMASQ_CONF"
 
+    # Configure iptables for NAT
     iptables -t nat -A POSTROUTING -o "$WAN_IFACE" -j MASQUERADE
     iptables -A FORWARD -i "$WAN_IFACE" -o "$WIFI_IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT
     iptables -A FORWARD -i "$WIFI_IFACE" -o "$WAN_IFACE" -j ACCEPT
@@ -221,6 +220,8 @@ interface=$WIFI_IFACE
 bind-interfaces
 server=$LAN_DNS_SERVER
 dhcp-range=$LAN_DHCP_START,$LAN_DHCP_END,255.255.255.0,12h
+dhcp-option=3,$LAN_IP       # Gateway
+dhcp-option=6,$LAN_DNS_SERVER  # DNS Server
 EOF
 
     log_info "Starting dnsmasq"
@@ -256,6 +257,8 @@ interface=$BR_IFACE
 bind-interfaces
 server=$LAN_DNS_SERVER
 dhcp-range=$LAN_DHCP_START,$LAN_DHCP_END,255.255.255.0,12h
+dhcp-option=3,$LAN_IP       # Gateway
+dhcp-option=6,$LAN_DNS_SERVER  # DNS Server
 EOF
 
     log_info "Starting dnsmasq"
