@@ -1,4 +1,9 @@
 #!/bin/bash
+
+# Enhanced Wireless Access Point Setup Script
+# Supports 'nat', 'proxy_arp', and 'bridge' methods
+# Provides robust error handling and user feedback
+
 # VARIABLES
 # Interfaces (Set to empty to enable auto-detection)
 WAN_IFACE=""          # Internet-facing interface (e.g., eth0)
@@ -26,6 +31,7 @@ DNSMASQ_CONF="/tmp/tmp_dnsmasq.conf"
 HOSTAPD_CONF="/tmp/tmp_hostapd.conf"
 IPTABLES_RULES="/tmp/iptables.rules"
 
+# Functions for error handling and logging
 function log_info {
     echo -e "\e[32m[INFO]\e[0m $1"
 }
@@ -115,6 +121,8 @@ function cleanup {
         ip link delete br0 type bridge &> /dev/null
     fi
 
+    restore_backup /etc/dnsmasq.conf
+
     rm -f "$DNSMASQ_CONF" "$HOSTAPD_CONF" "$IPTABLES_RULES"
 }
 
@@ -179,10 +187,12 @@ function setup_nat {
     ip addr add "$LAN_IP/24" dev "$WIFI_IFACE"
 
     backup_file /etc/dnsmasq.conf
+    killall dnsmasq
     cat > "$DNSMASQ_CONF" << EOF
 interface=$WIFI_IFACE
+bind-interfaces
+server=$LAN_DNS_SERVER
 dhcp-range=$LAN_DHCP_START,$LAN_DHCP_END,255.255.255.0,12h
-dhcp-option=6,$LAN_DNS_SERVER
 EOF
 
     log_info "Starting dnsmasq"
@@ -205,14 +215,20 @@ function setup_proxy_arp {
     ip addr add "$LAN_IP/24" dev "$WIFI_IFACE"
 
     backup_file /etc/dnsmasq.conf
+    killall dnsmasq
     cat > "$DNSMASQ_CONF" << EOF
 interface=$WIFI_IFACE
+bind-interfaces
+server=$LAN_DNS_SERVER
 dhcp-range=$LAN_DHCP_START,$LAN_DHCP_END,255.255.255.0,12h
-dhcp-option=6,$LAN_DNS_SERVER
 EOF
 
     log_info "Starting dnsmasq"
     dnsmasq -C "$DNSMASQ_CONF"
+
+    iptables -t nat -A POSTROUTING -o "$WAN_IFACE" -j MASQUERADE
+    iptables -A FORWARD -i "$WIFI_IFACE" -o "$WAN_IFACE" -j ACCEPT
+    iptables -A FORWARD -i "$WAN_IFACE" -o "$WIFI_IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT
 
     log_info "Proxy ARP configuration completed"
 }
@@ -221,6 +237,7 @@ function setup_bridge {
     log_info "Configuring Bridge"
 
     BR_IFACE="br0"
+
     ip link add name "$BR_IFACE" type bridge
 
     ip link set dev "$WAN_IFACE" up
@@ -233,10 +250,12 @@ function setup_bridge {
     ip addr add "$LAN_IP/24" dev "$BR_IFACE"
 
     backup_file /etc/dnsmasq.conf
+    killall dnsmasq
     cat > "$DNSMASQ_CONF" << EOF
 interface=$BR_IFACE
+bind-interfaces
+server=$LAN_DNS_SERVER
 dhcp-range=$LAN_DHCP_START,$LAN_DHCP_END,255.255.255.0,12h
-dhcp-option=6,$LAN_DNS_SERVER
 EOF
 
     log_info "Starting dnsmasq"
@@ -247,15 +266,13 @@ EOF
     log_info "Bridge configuration completed"
 }
 
-# Start the access point
 setup_ap
 
-# Wait for user to terminate the script
 trap cleanup EXIT
 
 log_info "Access point is running. Press Ctrl+C to stop."
 
-# Keep the script running
 while true; do
     sleep 60
 done
+
