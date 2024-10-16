@@ -29,6 +29,7 @@ cd $SCRIPT_RELATIVE_DIR
 echo "== stop router services"
 sudo killall wpa_supplicant
 sudo killall dnsmasq
+sudo killall hostapd
 
 echo "== reset all network interfaces"
 sudo ifconfig $LAN_IFACE 0.0.0.0
@@ -41,12 +42,15 @@ sudo brctl delbr $BR_IFACE
 
 if [ $1 = "up" ]; then
 
+    echo "== Enabling IP forwarding"
+    sudo sysctl -w net.ipv4.ip_forward=1
+
     echo "== create dnsmasq config file"
     echo "interface=${BR_IFACE}" > $DNSMASQ_CONF
     echo "dhcp-range=${LAN_DHCP_START},${LAN_DHCP_END},${LAN_SUBNET},12h" >> $DNSMASQ_CONF
     echo "dhcp-option=6,${LAN_DNS_SERVER}" >> $DNSMASQ_CONF
     
-    echo "create hostapd config file"
+    echo "== create hostapd config file"
     echo "interface=${WIFI_IFACE}" > $HOSTAPD_CONF
     echo "bridge=${BR_IFACE}" >> $HOSTAPD_CONF
     echo "ssid=${WIFI_SSID}" >> $HOSTAPD_CONF
@@ -61,30 +65,31 @@ if [ $1 = "up" ]; then
     #echo "ieee80211w=1" >> $HOSTAPD_CONF # PMF
     
     echo "== bring up interfaces and bridge"
-    sudo ifconfig $WIFI_IFACE up
     sudo ifconfig $WAN_IFACE up
     sudo ifconfig $LAN_IFACE up
+    sudo ifconfig $WIFI_IFACE up
     sudo brctl addbr $BR_IFACE
     sudo brctl addif $BR_IFACE $LAN_IFACE
+    sudo brctl addif $BR_IFACE $WIFI_IFACE  # Add Wi-Fi interface to bridge
     sudo ifconfig $BR_IFACE up
-    
-    echo "== setup iptables"
+
+    echo "== setting static IP on bridge interface"
+    sudo ifconfig $BR_IFACE $LAN_IP netmask $LAN_SUBNET
+
+    echo "== setting up iptables"
     sudo iptables --flush
     sudo iptables -t nat --flush
+
     sudo iptables -t nat -A POSTROUTING -o $WAN_IFACE -j MASQUERADE
-    sudo iptables -A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+
+    sudo iptables -A FORWARD -i $WAN_IFACE -o $BR_IFACE -m state --state RELATED,ESTABLISHED -j ACCEPT
     sudo iptables -A FORWARD -i $BR_IFACE -o $WAN_IFACE -j ACCEPT
-    # optional mitm rules
-    #sudo iptables -t nat -A PREROUTING -i $BR_IFACE -p tcp -d 1.2.3.4 --dport 443 -j REDIRECT --to-ports 8081
-    
-    
-    echo "== setting static IP on bridge interface"
-    sudo ifconfig br0 inet $LAN_IP netmask $LAN_SUBNET
-    
+
     echo "== starting dnsmasq"
     sudo dnsmasq -C $DNSMASQ_CONF
     
     echo "== starting hostapd"
     sudo hostapd $HOSTAPD_CONF
+
 fi
 
