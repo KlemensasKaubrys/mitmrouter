@@ -1,95 +1,261 @@
 #!/bin/bash
-
 # VARIABLES
-BR_IFACE="br0"
-WAN_IFACE="eth0"
-LAN_IFACE="eth1"
-WIFI_IFACE="wlan0"
+# Interfaces (Set to empty to enable auto-detection)
+WAN_IFACE=""          # Internet-facing interface (e.g., eth0)
+LAN_IFACE=""          # Optional, if you have a LAN interface (e.g., eth1)
+WIFI_IFACE=""         # Wireless interface for AP (e.g., wlan0)
+
+# Wireless Network Configuration
 WIFI_SSID="setec_astronomy"
 WIFI_PASSWORD="mypassword"
+COUNTRY_CODE="US"
+CHANNEL="11"
 
+# Network Configuration
 LAN_IP="192.168.200.1"
 LAN_SUBNET="255.255.255.0"
 LAN_DHCP_START="192.168.200.10"
 LAN_DHCP_END="192.168.200.100"
 LAN_DNS_SERVER="1.1.1.1"
 
-DNSMASQ_CONF="tmp_dnsmasq.conf"
-HOSTAPD_CONF="tmp_hostapd.conf"
+# Method Selection: Choose 'nat', 'proxy_arp', or 'bridge'
+METHOD="nat"
+
+# Configuration Files
+DNSMASQ_CONF="/tmp/tmp_dnsmasq.conf"
+HOSTAPD_CONF="/tmp/tmp_hostapd.conf"
+IPTABLES_RULES="/tmp/iptables.rules"
+
+function log_info {
+    echo -e "\e[32m[INFO]\e[0m $1"
+}
+
+function log_error {
+    echo -e "\e[31m[ERROR]\e[0m $1"
+}
+
+function check_command {
+    if ! command -v $1 &> /dev/null; then
+        log_error "Command '$1' not found. Please install it and try again."
+        exit 1
+    fi
+}
+
+function require_sudo {
+    if [ "$EUID" -ne 0 ]; then
+        log_error "This script must be run as root. Use sudo."
+        exit 1
+    fi
+}
+
+function backup_file {
+    if [ -f "$1" ]; then
+        cp "$1" "$1.bak"
+        log_info "Backup of $1 saved as $1.bak"
+    fi
+}
+
+function restore_backup {
+    if [ -f "$1.bak" ]; then
+        mv "$1.bak" "$1"
+        log_info "Restored backup of $1 from $1.bak"
+    fi
+}
+
+require_sudo
+
+check_command ip
+check_command iw
+check_command hostapd
+check_command dnsmasq
+check_command iptables
+
+function detect_interfaces {
+    if [ -z "$WAN_IFACE" ]; then
+        WAN_IFACE=$(ip route | grep default | awk '{print $5}' | head -n1)
+        log_info "Auto-detected WAN interface: $WAN_IFACE"
+    fi
+
+    if [ -z "$WIFI_IFACE" ]; then
+        WIFI_IFACE=$(iw dev | awk '$1=="Interface"{print $2}' | head -n1)
+        log_info "Auto-detected Wi-Fi interface: $WIFI_IFACE"
+    fi
+
+    if [ -z "$WAN_IFACE" ] || [ -z "$WIFI_IFACE" ]; then
+        log_error "Could not auto-detect interfaces. Please specify them manually."
+        exit 1
+    fi
+}
+
+detect_interfaces
 
 if [ "$1" != "up" ] && [ "$1" != "down" ] || [ $# != 1 ]; then
-    echo "missing required argument"
-    echo "$0: <up/down>"
-    exit
+    echo "Usage: $0 <up/down>"
+    exit 1
 fi
 
-SCRIPT_RELATIVE_DIR=$(dirname "${BASH_SOURCE[0]}") 
-cd $SCRIPT_RELATIVE_DIR
+function cleanup {
+    log_info "Stopping services and cleaning up"
+    systemctl stop hostapd dnsmasq &> /dev/null
+    pkill hostapd
+    pkill dnsmasq
 
-echo "== stop router services"
-sudo killall wpa_supplicant
-sudo killall dnsmasq
-sudo killall hostapd
+    iptables --flush
+    iptables -t nat --flush
+    iptables -t mangle --flush
+    iptables -X
 
-echo "== reset all network interfaces"
-sudo ifconfig $LAN_IFACE 0.0.0.0
-sudo ifconfig $LAN_IFACE down
-sudo ifconfig $BR_IFACE 0.0.0.0
-sudo ifconfig $BR_IFACE down
-sudo ifconfig $WIFI_IFACE 0.0.0.0
-sudo ifconfig $WIFI_IFACE down
-sudo brctl delbr $BR_IFACE
+    sysctl -w net.ipv4.ip_forward=0 &> /dev/null
 
-if [ $1 = "up" ]; then
+    ip addr flush dev "$WIFI_IFACE"
+    ip link set dev "$WIFI_IFACE" down
 
-    echo "== Enabling IP forwarding"
-    sudo sysctl -w net.ipv4.ip_forward=1
+    if [ "$METHOD" = "bridge" ]; then
+        ip link set dev br0 down &> /dev/null
+        ip link delete br0 type bridge &> /dev/null
+    fi
 
-    echo "== create dnsmasq config file"
-    echo "interface=${BR_IFACE}" > $DNSMASQ_CONF
-    echo "dhcp-range=${LAN_DHCP_START},${LAN_DHCP_END},${LAN_SUBNET},12h" >> $DNSMASQ_CONF
-    echo "dhcp-option=6,${LAN_DNS_SERVER}" >> $DNSMASQ_CONF
-    
-    echo "== create hostapd config file"
-    echo "interface=${WIFI_IFACE}" > $HOSTAPD_CONF
-    echo "bridge=${BR_IFACE}" >> $HOSTAPD_CONF
-    echo "ssid=${WIFI_SSID}" >> $HOSTAPD_CONF
-    echo "country_code=US" >> $HOSTAPD_CONF
-    echo "hw_mode=g" >> $HOSTAPD_CONF
-    echo "channel=11" >> $HOSTAPD_CONF
-    echo "wpa=2" >> $HOSTAPD_CONF
-    echo "wpa_passphrase=${WIFI_PASSWORD}" >> $HOSTAPD_CONF
-    echo "wpa_key_mgmt=WPA-PSK" >> $HOSTAPD_CONF
-    echo "wpa_pairwise=CCMP" >> $HOSTAPD_CONF
-    echo "ieee80211n=1" >> $HOSTAPD_CONF
-    #echo "ieee80211w=1" >> $HOSTAPD_CONF # PMF
-    
-    echo "== bring up interfaces and bridge"
-    sudo ifconfig $WAN_IFACE up
-    sudo ifconfig $LAN_IFACE up
-    sudo ifconfig $WIFI_IFACE up
-    sudo brctl addbr $BR_IFACE
-    sudo brctl addif $BR_IFACE $LAN_IFACE
-    sudo brctl addif $BR_IFACE $WIFI_IFACE  # Add Wi-Fi interface to bridge
-    sudo ifconfig $BR_IFACE up
+    rm -f "$DNSMASQ_CONF" "$HOSTAPD_CONF" "$IPTABLES_RULES"
+}
 
-    echo "== setting static IP on bridge interface"
-    sudo ifconfig $BR_IFACE $LAN_IP netmask $LAN_SUBNET
-
-    echo "== setting up iptables"
-    sudo iptables --flush
-    sudo iptables -t nat --flush
-
-    sudo iptables -t nat -A POSTROUTING -o $WAN_IFACE -j MASQUERADE
-
-    sudo iptables -A FORWARD -i $WAN_IFACE -o $BR_IFACE -m state --state RELATED,ESTABLISHED -j ACCEPT
-    sudo iptables -A FORWARD -i $BR_IFACE -o $WAN_IFACE -j ACCEPT
-
-    echo "== starting dnsmasq"
-    sudo dnsmasq -C $DNSMASQ_CONF
-    
-    echo "== starting hostapd"
-    sudo hostapd $HOSTAPD_CONF
-
+if [ "$1" = "down" ]; then
+    cleanup
+    log_info "Access point stopped and cleaned up"
+    exit 0
 fi
 
+function setup_ap {
+    log_info "Setting up the access point using method: $METHOD"
+
+    sysctl -w net.ipv4.ip_forward=1
+
+    ip link set dev "$WIFI_IFACE" up
+    iw dev "$WIFI_IFACE" set power_save off
+
+    cat > "$HOSTAPD_CONF" << EOF
+interface=$WIFI_IFACE
+ssid=$WIFI_SSID
+hw_mode=g
+channel=$CHANNEL
+wpa=2
+wpa_passphrase=$WIFI_PASSWORD
+wpa_key_mgmt=WPA-PSK
+wpa_pairwise=CCMP
+country_code=$COUNTRY_CODE
+ieee80211n=1
+EOF
+
+    case "$METHOD" in
+        nat)
+            setup_nat
+            ;;
+        proxy_arp)
+            setup_proxy_arp
+            ;;
+        bridge)
+            setup_bridge
+            ;;
+        *)
+            log_error "Invalid METHOD selected. Choose 'nat', 'proxy_arp', or 'bridge'."
+            exit 1
+            ;;
+    esac
+
+    log_info "Starting hostapd"
+    hostapd "$HOSTAPD_CONF" &
+    sleep 2
+
+    if pgrep hostapd > /dev/null; then
+        log_info "hostapd started successfully"
+    else
+        log_error "Failed to start hostapd. Check configuration and logs."
+        exit 1
+    fi
+}
+
+function setup_nat {
+    log_info "Configuring NAT"
+
+    ip addr add "$LAN_IP/24" dev "$WIFI_IFACE"
+
+    backup_file /etc/dnsmasq.conf
+    cat > "$DNSMASQ_CONF" << EOF
+interface=$WIFI_IFACE
+dhcp-range=$LAN_DHCP_START,$LAN_DHCP_END,255.255.255.0,12h
+dhcp-option=6,$LAN_DNS_SERVER
+EOF
+
+    log_info "Starting dnsmasq"
+    dnsmasq -C "$DNSMASQ_CONF"
+
+    iptables -t nat -A POSTROUTING -o "$WAN_IFACE" -j MASQUERADE
+    iptables -A FORWARD -i "$WAN_IFACE" -o "$WIFI_IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT
+    iptables -A FORWARD -i "$WIFI_IFACE" -o "$WAN_IFACE" -j ACCEPT
+
+    log_info "NAT configuration completed"
+}
+
+function setup_proxy_arp {
+    log_info "Configuring Proxy ARP"
+
+    sysctl -w net.ipv4.conf."$WAN_IFACE".proxy_arp=1
+    sysctl -w net.ipv4.conf."$WIFI_IFACE".proxy_arp=1
+
+    ip addr add "$LAN_IP/24" dev "$WAN_IFACE"
+    ip addr add "$LAN_IP/24" dev "$WIFI_IFACE"
+
+    backup_file /etc/dnsmasq.conf
+    cat > "$DNSMASQ_CONF" << EOF
+interface=$WIFI_IFACE
+dhcp-range=$LAN_DHCP_START,$LAN_DHCP_END,255.255.255.0,12h
+dhcp-option=6,$LAN_DNS_SERVER
+EOF
+
+    log_info "Starting dnsmasq"
+    dnsmasq -C "$DNSMASQ_CONF"
+
+    log_info "Proxy ARP configuration completed"
+}
+
+function setup_bridge {
+    log_info "Configuring Bridge"
+
+    BR_IFACE="br0"
+    ip link add name "$BR_IFACE" type bridge
+
+    ip link set dev "$WAN_IFACE" up
+    ip link set dev "$WIFI_IFACE" up
+    ip link set dev "$BR_IFACE" up
+
+    ip link set dev "$WAN_IFACE" master "$BR_IFACE"
+    ip link set dev "$WIFI_IFACE" master "$BR_IFACE"
+
+    ip addr add "$LAN_IP/24" dev "$BR_IFACE"
+
+    backup_file /etc/dnsmasq.conf
+    cat > "$DNSMASQ_CONF" << EOF
+interface=$BR_IFACE
+dhcp-range=$LAN_DHCP_START,$LAN_DHCP_END,255.255.255.0,12h
+dhcp-option=6,$LAN_DNS_SERVER
+EOF
+
+    log_info "Starting dnsmasq"
+    dnsmasq -C "$DNSMASQ_CONF"
+
+    echo "bridge=$BR_IFACE" >> "$HOSTAPD_CONF"
+
+    log_info "Bridge configuration completed"
+}
+
+# Start the access point
+setup_ap
+
+# Wait for user to terminate the script
+trap cleanup EXIT
+
+log_info "Access point is running. Press Ctrl+C to stop."
+
+# Keep the script running
+while true; do
+    sleep 60
+done
